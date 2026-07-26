@@ -62,7 +62,7 @@ Storage layout: `TreeMap[str, Proposal]` with an `@allow_storage @dataclass` str
 
 | | |
 |---|---|
-| **CONTRACT_ADDRESS** | `0x16C5E52a4ac8B01327b742B183F03af649EaB44A` |
+| **CONTRACT_ADDRESS** | `0xba59d06F131c41b27A6e7c168A73f8901fe0a58d` |
 | **NETWORK** | `studionet` (GenLayer Studio network) |
 
 Constructor used: `dao_name="GenLayer Community Grants"`, a public-goods rubric as `criteria`, `min_total_score=30`, `min_confidence=70`, `submit_cooldown_secs` per deployment.
