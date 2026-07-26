@@ -219,6 +219,40 @@ def test_evaluation_requires_treasury_coverage(direct_vm, direct_deploy):
         contract.evaluate_proposal(0)
 
 
+def test_evaluation_fails_closed_on_malformed_llm_output(direct_vm, direct_deploy):
+    """GL-TST-004: malformed LLM output must abort, never silently pass."""
+    contract = direct_deploy(CONTRACT, *DEPLOY_ARGS)
+    _fund_treasury(direct_vm, contract, 2 * 10**18)
+    _submit(contract)
+
+    direct_vm.mock_llm(r"grant evaluation committee", "sorry, no JSON today")
+    with direct_vm.expect_revert("unparseable"):
+        contract.evaluate_proposal(0)
+    # fail-closed means retryable: the proposal is still in submitted state
+    assert contract.get_proposal(0)["status_name"] == "submitted"
+
+
+def test_evaluation_fails_closed_on_missing_decision(direct_vm, direct_deploy):
+    """No silent fallback: a missing decision aborts instead of being derived."""
+    contract = direct_deploy(CONTRACT, *DEPLOY_ARGS)
+    _fund_treasury(direct_vm, contract, 2 * 10**18)
+    _submit(contract)
+
+    no_decision = json.dumps(
+        {
+            "scores": {
+                "impact": 9, "feasibility": 9, "innovation": 9,
+                "budget": 9, "credibility": 9,
+            },
+            "reasoning": "Great, but I forgot to decide.",
+        }
+    )
+    direct_vm.mock_llm(r"grant evaluation committee", no_decision)
+    with direct_vm.expect_revert("valid approve/reject decision"):
+        contract.evaluate_proposal(0)
+    assert contract.get_proposal(0)["status_name"] == "submitted"
+
+
 # ---------------------------------------------------------------------------
 # Milestone verification & payout (web + LLM mocked)
 # ---------------------------------------------------------------------------
@@ -280,6 +314,32 @@ def test_final_milestone_sweeps_remainder_and_completes(direct_vm, direct_deploy
     assert p["status_name"] == "completed"
     assert p["paid_wei"] == 10**18          # exact total, no rounding dust
     assert contract.get_summary()["committed_wei"] == 0
+
+
+def test_claim_fails_closed_on_unavailable_evidence(direct_vm, direct_deploy):
+    """GL-TST-005: an unavailable evidence page must abort the claim."""
+    contract = _approved_proposal(direct_vm, direct_deploy)
+    direct_vm.mock_web(
+        r"github\.com/example",
+        {"status": 404, "body": "not found"},
+    )
+    with direct_vm.expect_revert("HTTP 404"):
+        contract.claim_milestone(0, "https://github.com/example/repo")
+    assert contract.get_proposal(0)["paid_wei"] == 0
+
+
+def test_claim_rejects_unsafe_evidence_urls(direct_vm, direct_deploy):
+    """SSRF policy: https-only, public domain names only."""
+    contract = _approved_proposal(direct_vm, direct_deploy)
+    with direct_vm.expect_revert("https"):
+        contract.claim_milestone(0, "http://github.com/example/repo")
+    with direct_vm.expect_revert("IP address"):
+        contract.claim_milestone(0, "https://127.0.0.1/evidence")
+    with direct_vm.expect_revert("not allowed"):
+        contract.claim_milestone(0, "https://metadata.google.internal/computeMetadata")
+    with direct_vm.expect_revert("default https port"):
+        contract.claim_milestone(0, "https://internal-host.example.com:8080/x")
+    assert contract.get_proposal(0)["paid_wei"] == 0
 
 
 def test_only_proposer_can_claim(direct_vm, direct_deploy, direct_bob):
