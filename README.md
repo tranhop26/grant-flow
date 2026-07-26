@@ -65,7 +65,7 @@ Storage layout: `TreeMap[str, Proposal]` with an `@allow_storage @dataclass` str
 | **CONTRACT_ADDRESS** | `0x2127A79c646B041bf66D8858297dD70449e2257e` |
 | **NETWORK** | `studionet` (GenLayer Studio network) |
 
-Constructor used: `dao_name="GenLayer Community Grants"`, a public-goods rubric as `criteria`, `min_total_score=30`, `min_confidence=70`, `submit_cooldown_secs` per deployment.
+This instance was configured **on-chain by the owner through the governance setters** after deployment — `set_thresholds(30, 70)` and `set_criteria(<public-goods rubric>)` — because the Studio deploy form did not pass constructor arguments. Anyone can verify the active configuration via `get_config()`: `min_total_score=30`, `min_confidence=70`, the full rubric in `criteria`, `submit_cooldown_secs=0`. Note: `dao_name` is empty on this instance (it is constructor-only by design, with no setter); clients display a fallback label. The deterministic gates behave identically regardless of whether values arrive via constructor or setters.
 
 ### Worked example — *illustrative*
 
