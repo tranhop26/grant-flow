@@ -36,6 +36,8 @@ The LLM never moves money, never sets status directly, and cannot exceed the tre
 ## Security hardening
 
 * **Prompt-injection defense** — applicant text is fenced in `<untrusted_applicant_data>` markers, the marker strings are stripped from user input, and the committee prompt instructs the model to ignore embedded instructions *and penalize the credibility score of manipulation attempts*. An injection attempt lowers the attacker's score.
+* **Fail-closed AI outputs** — malformed LLM output, a missing score, or a missing `decision` **aborts the transaction** instead of being silently derived or defaulted. Nothing about adjudication is ever substituted by a fallback; the proposal stays in `submitted` state and can simply be re-evaluated. Milestone verdicts default to *deny* (`completed=false, confidence=0`) on missing fields — safe for the treasury, retryable for the grantee.
+* **SSRF-hardened evidence URLs** — validators fetch the evidence URL themselves, so the contract enforces: `https://` only, public domain names only (no IP literals, no `localhost`, no `.internal`/`.local`-style suffixes, no cloud-metadata hosts), no embedded credentials, no explicit ports. *Residual risk:* DNS rebinding cannot be fully prevented at the contract layer — validator operators should enforce private-range egress blocking in their web-fetch infrastructure.
 * **Nondet purity** — non-deterministic closures never touch `self` or storage; all needed values are captured as locals first.
 * **Sequential milestones** — tranches release strictly in order; each claim stores an immutable JSON audit report on-chain.
 * **No rounding dust** — the final milestone sweeps the exact remainder.
@@ -104,7 +106,7 @@ Then `claim_milestone(0, "https://github.com/example/validator-analytics/release
 ```
 .
 ├── contracts/grant_flow.py         # the Intelligent Contract (single file, pure ASCII)
-├── tests/test_grant_flow.py        # 14 tests: rubric gate, payouts, injection-safe paths
+├── tests/test_grant_flow.py        # 18 tests: rubric gate, payouts, fail-closed negative paths
 ├── tests/conftest.py               # uses genlayer-test fixtures when installed
 ├── tests/_emulator.py              # fallback fixtures for sandboxes without PyPI access
 ├── tests/run_tests.py              # zero-dependency runner (python3 tests/run_tests.py)
@@ -121,7 +123,9 @@ pytest tests/ -v                      # official genlayer-test Direct Mode
 python3 tests/run_tests.py
 ```
 
-The suite covers: deploy/config, submission validation (milestone percents, minimum lengths), AI approval and rejection, **the deterministic gate overriding an over-optimistic LLM**, treasury-coverage enforcement, milestone payout on verified evidence, denial on weak evidence, exact remainder sweeping, proposer-only claims, owner access control, pause, and cancellation accounting.
+The suite covers: deploy/config, submission validation (milestone percents, minimum lengths), AI approval and rejection, **the deterministic gate overriding an over-optimistic LLM**, treasury-coverage enforcement, milestone payout on verified evidence, denial on weak evidence, exact remainder sweeping, proposer-only claims, owner access control, pause, cancellation accounting, and the fail-closed negative paths: malformed LLM output, missing decision, unavailable (HTTP 404) evidence, and SSRF-blocked evidence URLs.
+
+*Known limitation:* direct mode and the emulator execute leader-only; genuine multi-validator disagreement is exercised on-chain by the equivalence-principle strings (identical decision, bounded drift), not in unit tests.
 
 ## Reuse beyond grants
 
