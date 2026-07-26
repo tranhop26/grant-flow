@@ -69,25 +69,47 @@ def _clamp(value: typing.Any, lo: int, hi: int, default: int) -> int:
     return max(lo, min(hi, v))
 
 
-def _sanitize_evaluation(data: typing.Any, min_total_score: int) -> dict:
-    """Clamp and normalize the LLM evaluation before it leaves the
-    non-deterministic block, so validators compare stable shapes.
-    Pure function: safe to call from inside nondet closures."""
+def _parse_llm_json(data: typing.Any) -> dict:
+    """Parse LLM output into a dict, fail-closed on malformed content."""
     if isinstance(data, str):
-        data = json.loads(data.replace("```json", "").replace("```", "").strip())
+        try:
+            data = json.loads(
+                data.replace("```json", "").replace("```", "").strip()
+            )
+        except Exception:
+            raise gl.vm.UserError("LLM returned unparseable output")
     if not isinstance(data, dict):
-        raise gl.vm.UserError("LLM returned a non-object evaluation")
+        raise gl.vm.UserError("LLM returned a non-object result")
+    return data
+
+
+def _sanitize_evaluation(data: typing.Any) -> dict:
+    """Normalize the LLM evaluation before it leaves the non-deterministic
+    block, so validators compare stable shapes. FAIL-CLOSED: a missing or
+    invalid decision/score aborts the transaction (the proposal stays in
+    the submitted state and can be re-evaluated) instead of being silently
+    derived - the LLM's judgment is never substituted by a fallback.
+    Pure function: safe to call from inside nondet closures."""
+    data = _parse_llm_json(data)
     raw_scores = data.get("scores")
     if not isinstance(raw_scores, dict):
-        raw_scores = {}
-    scores = {
-        dim: _clamp(raw_scores.get(dim), 0, MAX_SCORE_PER_DIMENSION, 0)
-        for dim in SCORE_DIMENSIONS
-    }
+        raise gl.vm.UserError("LLM evaluation is missing the scores object")
+    scores = {}
+    for dim in SCORE_DIMENSIONS:
+        value = raw_scores.get(dim)
+        if isinstance(value, bool):
+            raise gl.vm.UserError(f"LLM evaluation score for {dim} is not an integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise gl.vm.UserError(f"LLM evaluation score for {dim} is not an integer")
+        scores[dim] = max(0, min(MAX_SCORE_PER_DIMENSION, parsed))
     total = sum(scores.values())
     decision = str(data.get("decision", "")).strip().lower()
     if decision not in ("approve", "reject"):
-        decision = "approve" if total >= min_total_score else "reject"
+        raise gl.vm.UserError(
+            "LLM evaluation is missing a valid approve/reject decision"
+        )
     reasoning = str(data.get("reasoning", "")).strip()[:MAX_REASONING_CHARS]
     return {
         "scores": scores,
@@ -98,16 +120,54 @@ def _sanitize_evaluation(data: typing.Any, min_total_score: int) -> dict:
 
 
 def _sanitize_verification(data: typing.Any) -> dict:
-    """Normalize the LLM milestone verdict. Pure function."""
-    if isinstance(data, str):
-        data = json.loads(data.replace("```json", "").replace("```", "").strip())
-    if not isinstance(data, dict):
-        raise gl.vm.UserError("LLM returned a non-object verification")
+    """Normalize the LLM milestone verdict. Missing fields default to a
+    DENYING verdict (completed=False, confidence=0) - fail-closed for the
+    treasury; a denied claim can be retried with better evidence.
+    Pure function: safe to call from inside nondet closures."""
+    data = _parse_llm_json(data)
     return {
         "completed": bool(data.get("completed", False)),
         "confidence": _clamp(data.get("confidence"), 0, 100, 0),
         "summary": str(data.get("summary", "")).strip()[:MAX_REASONING_CHARS],
     }
+
+
+BLOCKED_URL_HOSTS = ("localhost", "metadata.google.internal", "169.254.169.254")
+BLOCKED_URL_SUFFIXES = (".local", ".localhost", ".internal", ".lan", ".home", ".corp")
+
+
+def _validate_evidence_url(url: str) -> str:
+    """SSRF-hardened evidence URL policy (fail-closed).
+
+    Validators fetch this URL themselves, so it must never be able to point
+    at loopback, private-network or cloud-metadata targets:
+    https only, public domain names only (no IP literals), no credentials,
+    no explicit port, no blocked internal suffixes. Residual DNS-rebinding
+    risk is a validator-infrastructure concern (egress policy) and is
+    documented in the README.
+    """
+    url = url.strip()
+    if any(c.isspace() for c in url):
+        raise gl.vm.UserError("evidence_url must not contain whitespace")
+    if not url.startswith("https://"):
+        raise gl.vm.UserError("evidence_url must start with https://")
+    host = url[len("https://"):].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    host = host.lower().rstrip(".")
+    if not host:
+        raise gl.vm.UserError("evidence_url has no host")
+    if "@" in host:
+        raise gl.vm.UserError("evidence_url must not contain credentials")
+    if ":" in host or host.startswith("["):
+        # rejects explicit ports and IPv6 literals in one check
+        raise gl.vm.UserError("evidence_url must use the default https port")
+    if host in BLOCKED_URL_HOSTS or any(host.endswith(s) for s in BLOCKED_URL_SUFFIXES):
+        raise gl.vm.UserError("evidence_url host is not allowed")
+    parts = host.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        raise gl.vm.UserError("evidence_url must use a domain name, not an IP address")
+    if "." not in host:
+        raise gl.vm.UserError("evidence_url host must be a public domain")
+    return url
 
 
 # ------------- ghost-contract interface (EOA value transfers) --------------
@@ -385,7 +445,7 @@ Respond ONLY with a JSON object shaped exactly like:
 
         def do_evaluation() -> dict:
             result = gl.nondet.exec_prompt(prompt, response_format="json")
-            return _sanitize_evaluation(result, min_score)
+            return _sanitize_evaluation(result)
 
         evaluation = gl.eq_principle.prompt_comparative(
             do_evaluation,
@@ -444,12 +504,7 @@ Respond ONLY with a JSON object shaped exactly like:
             raise gl.vm.UserError("all milestones have already been released")
         milestone = milestones[idx]
 
-        evidence_url = _clean_user_text(evidence_url, 300)
-        if not (
-            evidence_url.startswith("https://")
-            or evidence_url.startswith("http://")
-        ):
-            raise gl.vm.UserError("evidence_url must be an http(s) URL")
+        evidence_url = _validate_evidence_url(_clean_user_text(evidence_url, 300))
 
         description = str(milestone["description"])
         percent = int(milestone["percent"])
