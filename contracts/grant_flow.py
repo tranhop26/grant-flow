@@ -83,7 +83,7 @@ def _parse_llm_json(data: typing.Any) -> dict:
     return data
 
 
-def _sanitize_evaluation(data: typing.Any) -> dict:
+def _sanitize_evaluation(data: typing.Any, min_total_score: int) -> dict:
     """Normalize the LLM evaluation before it leaves the non-deterministic
     block, so validators compare stable shapes. FAIL-CLOSED: a missing or
     invalid decision/score aborts the transaction (the proposal stays in
@@ -111,23 +111,28 @@ def _sanitize_evaluation(data: typing.Any) -> dict:
             "LLM evaluation is missing a valid approve/reject decision"
         )
     reasoning = str(data.get("reasoning", "")).strip()[:MAX_REASONING_CHARS]
+    grant_approved = decision == "approve" and total >= min_total_score
     return {
         "scores": scores,
         "total": total,
         "decision": decision,
+        "grant_approved": grant_approved,
         "reasoning": reasoning,
     }
 
 
-def _sanitize_verification(data: typing.Any) -> dict:
+def _sanitize_verification(data: typing.Any, min_confidence: int) -> dict:
     """Normalize the LLM milestone verdict. Missing fields default to a
     DENYING verdict (completed=False, confidence=0) - fail-closed for the
     treasury; a denied claim can be retried with better evidence.
     Pure function: safe to call from inside nondet closures."""
     data = _parse_llm_json(data)
+    completed = bool(data.get("completed", False))
+    confidence = _clamp(data.get("confidence"), 0, 100, 0)
     return {
-        "completed": bool(data.get("completed", False)),
-        "confidence": _clamp(data.get("confidence"), 0, 100, 0),
+        "completed": completed,
+        "confidence": confidence,
+        "payout_approved": completed and confidence >= min_confidence,
         "summary": str(data.get("summary", "")).strip()[:MAX_REASONING_CHARS],
     }
 
@@ -170,6 +175,45 @@ def _validate_evidence_url(url: str) -> str:
     return url
 
 
+def _parse_milestones(milestones_json: str) -> str:
+    """Validate applicant milestones and return the canonical JSON."""
+    try:
+        raw = json.loads(milestones_json)
+    except Exception:
+        raise gl.vm.UserError(
+            'milestones must be JSON like '
+            '[{"description": "...", "percent": 50}, ...]'
+        )
+    if not isinstance(raw, list) or not (1 <= len(raw) <= MAX_MILESTONES):
+        raise gl.vm.UserError(
+            f"between 1 and {MAX_MILESTONES} milestones are required"
+        )
+    clean: list = []
+    percent_sum = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            raise gl.vm.UserError("each milestone must be an object")
+        description = _clean_user_text(str(item.get("description", "")), 500)
+        percent = item.get("percent")
+        if len(description) < 10:
+            raise gl.vm.UserError(
+                "each milestone needs a description of at least 10 characters"
+            )
+        if not isinstance(percent, int) or isinstance(percent, bool) or not (
+            1 <= percent <= 100
+        ):
+            raise gl.vm.UserError(
+                "each milestone needs an integer percent between 1 and 100"
+            )
+        percent_sum += percent
+        clean.append({"description": description, "percent": percent})
+    if percent_sum != 100:
+        raise gl.vm.UserError(
+            f"milestone percents must sum to exactly 100 (got {percent_sum})"
+        )
+    return json.dumps(clean, sort_keys=True)
+
+
 # ------------- ghost-contract interface (EOA value transfers) --------------
 
 @gl.evm.contract_interface
@@ -203,7 +247,7 @@ class Proposal:
 
 # ----------------------------- contract ------------------------------------
 
-class Contract(gl.Contract):
+class GrantFlow(gl.Contract):
     # governance / configuration
     owner: str                # lowercase hex address
     dao_name: str
@@ -274,45 +318,6 @@ class Contract(gl.Contract):
         committed = int(self.total_committed)
         return balance - committed if balance > committed else 0
 
-    @staticmethod
-    def _parse_milestones(milestones_json: str) -> str:
-        """Validate applicant milestones and return the canonical JSON."""
-        try:
-            raw = json.loads(milestones_json)
-        except Exception:
-            raise gl.vm.UserError(
-                'milestones must be JSON like '
-                '[{"description": "...", "percent": 50}, ...]'
-            )
-        if not isinstance(raw, list) or not (1 <= len(raw) <= MAX_MILESTONES):
-            raise gl.vm.UserError(
-                f"between 1 and {MAX_MILESTONES} milestones are required"
-            )
-        clean: list = []
-        percent_sum = 0
-        for item in raw:
-            if not isinstance(item, dict):
-                raise gl.vm.UserError("each milestone must be an object")
-            description = _clean_user_text(str(item.get("description", "")), 500)
-            percent = item.get("percent")
-            if len(description) < 10:
-                raise gl.vm.UserError(
-                    "each milestone needs a description of at least 10 characters"
-                )
-            if not isinstance(percent, int) or isinstance(percent, bool) or not (
-                1 <= percent <= 100
-            ):
-                raise gl.vm.UserError(
-                    "each milestone needs an integer percent between 1 and 100"
-                )
-            percent_sum += percent
-            clean.append({"description": description, "percent": percent})
-        if percent_sum != 100:
-            raise gl.vm.UserError(
-                f"milestone percents must sum to exactly 100 (got {percent_sum})"
-            )
-        return json.dumps(clean, sort_keys=True)
-
     # ----------------------------- treasury --------------------------------
 
     @gl.public.write.payable
@@ -362,7 +367,7 @@ class Contract(gl.Contract):
         if amount <= 0:
             raise gl.vm.UserError("requested_wei must be positive")
 
-        canonical_milestones = self._parse_milestones(milestones_json)
+        canonical_milestones = _parse_milestones(milestones_json)
         milestone_count = len(json.loads(canonical_milestones))
 
         pid = int(self.next_id)
@@ -445,21 +450,26 @@ Respond ONLY with a JSON object shaped exactly like:
 
         def do_evaluation() -> dict:
             result = gl.nondet.exec_prompt(prompt, response_format="json")
-            return _sanitize_evaluation(result)
+            return _sanitize_evaluation(result, min_score)
 
         evaluation = gl.eq_principle.prompt_comparative(
             do_evaluation,
             principle=(
-                "The `decision` field must be identical. Each individual score "
-                "may differ by at most 2 points and `total` by at most 5. "
+                "The `grant_approved` field is the final thresholded economic "
+                "outcome and must be identical. It is derived as `decision` "
+                f"equals approve AND `total` is at least {min_score}. The "
+                "`decision` field must also be identical. Each individual score "
+                "may differ by at most 2 points and `total` by at most 5 only "
+                "when those differences preserve the identical `grant_approved` "
+                "outcome. "
                 "`reasoning` must identify the same main strengths and "
                 "weaknesses."
             ),
         )
 
-        # deterministic gate: the code, not the LLM, closes the deal
+        # Consensus explicitly binds the final thresholded economic outcome.
         total = int(evaluation["total"])
-        approved = evaluation["decision"] == "approve" and total >= min_score
+        approved = bool(evaluation["grant_approved"])
 
         p.total_score = total
         if approved:
@@ -513,6 +523,7 @@ Respond ONLY with a JSON object shaped exactly like:
         dao_name = self.dao_name
         title = p.title
         url = evidence_url
+        min_confidence = int(self.min_confidence)
 
         def do_verification() -> dict:
             response = gl.nondet.web.get(url)
@@ -547,21 +558,23 @@ Respond ONLY with a JSON object shaped exactly like:
 "confidence": int from 0 to 100,
 "summary": "1-3 sentences describing what the evidence shows"}}"""
             result = gl.nondet.exec_prompt(prompt, response_format="json")
-            return _sanitize_verification(result)
+            return _sanitize_verification(result, min_confidence)
 
         verdict = gl.eq_principle.prompt_comparative(
             do_verification,
             principle=(
-                "The `completed` field must be identical. `confidence` may "
-                "differ by at most 20. `summary` must describe the same "
+                "The `payout_approved` field is the final thresholded economic "
+                "outcome and must be identical. It is derived as `completed` "
+                f"equals true AND `confidence` is at least {min_confidence}. "
+                "The `completed` field must also be identical. `confidence` may "
+                "differ by at most 20 only when both values remain on the same "
+                "side of the payout threshold. `summary` must describe the same "
                 "evidence and reach the same conclusion."
             ),
         )
 
-        # deterministic payout gate
-        passed = bool(verdict["completed"]) and int(verdict["confidence"]) >= int(
-            self.min_confidence
-        )
+        # Consensus explicitly binds the final thresholded economic outcome.
+        passed = bool(verdict["payout_approved"])
 
         amount = 0
         if passed:

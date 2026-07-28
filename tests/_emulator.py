@@ -307,7 +307,7 @@ def make_direct_deploy():
         source = open(path, encoding="utf-8").read()
         module = types.ModuleType("contract_under_test")
         exec(compile(source, path, "exec"), module.__dict__)
-        instance = module.Contract(*args)
+        instance = module.GrantFlow(*args)
         return ContractHandle(instance)
 
     return direct_deploy

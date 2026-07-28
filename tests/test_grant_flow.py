@@ -212,6 +212,39 @@ def test_deterministic_gate_overrides_llm_decision(direct_vm, direct_deploy):
     assert contract.get_proposal(0)["status_name"] == "rejected"
 
 
+def test_consensus_result_binds_grant_threshold(direct_vm, direct_deploy):
+    """The value compared by validators includes the final grant outcome,
+    including the exact threshold boundary."""
+    contract = direct_deploy(CONTRACT, *DEPLOY_ARGS)
+    _fund_treasury(direct_vm, contract, 2 * 10**18)
+    _submit(contract)
+
+    at_threshold = json.dumps(
+        {
+            "scores": {
+                "impact": 6, "feasibility": 6, "innovation": 6,
+                "budget": 6, "credibility": 6,
+            },
+            "decision": "approve",
+            "reasoning": "Meets the configured score threshold exactly.",
+        }
+    )
+    direct_vm.mock_llm(r"grant evaluation committee", at_threshold)
+    record = contract.evaluate_proposal(0)
+    assert record["evaluation"]["total"] == 30
+    assert record["evaluation"]["grant_approved"] is True
+    assert record["approved"] is True
+
+    below_contract = direct_deploy(CONTRACT, *DEPLOY_ARGS)
+    below_contract.set_thresholds(31, 70)
+    _fund_treasury(direct_vm, below_contract, 2 * 10**18)
+    _submit(below_contract)
+    record = below_contract.evaluate_proposal(0)
+    assert record["evaluation"]["total"] == 30
+    assert record["evaluation"]["grant_approved"] is False
+    assert record["approved"] is False
+
+
 def test_evaluation_requires_treasury_coverage(direct_vm, direct_deploy):
     contract = direct_deploy(CONTRACT, *DEPLOY_ARGS)
     _submit(contract)  # treasury is empty
@@ -297,6 +330,39 @@ def test_milestone_denied_on_weak_evidence(direct_vm, direct_deploy):
     assert report["paid"] is False
     assert contract.get_proposal(0)["released_count"] == 0
     assert contract.get_proposal(0)["paid_wei"] == 0
+
+
+def test_consensus_result_binds_payout_threshold(direct_vm, direct_deploy):
+    """The value compared by validators includes the final payout outcome,
+    including the exact confidence boundary."""
+    contract = _approved_proposal(direct_vm, direct_deploy)
+    direct_vm.mock_web(
+        r"github\.com/example",
+        {"status": 200, "body": "<html>MVP release is available</html>"},
+    )
+    at_threshold = json.dumps(
+        {
+            "completed": True,
+            "confidence": 70,
+            "summary": "The evidence shows the milestone was delivered.",
+        }
+    )
+    direct_vm.mock_llm(r"milestone auditor", at_threshold)
+    report = contract.claim_milestone(0, "https://github.com/example/repo")
+    assert report["verdict"]["payout_approved"] is True
+    assert report["paid"] is True
+
+    below_contract = _approved_proposal(direct_vm, direct_deploy)
+    below_contract.set_thresholds(30, 71)
+    direct_vm.mock_web(
+        r"github\.com/example",
+        {"status": 200, "body": "<html>MVP release is available</html>"},
+    )
+    report = below_contract.claim_milestone(
+        0, "https://github.com/example/repo"
+    )
+    assert report["verdict"]["payout_approved"] is False
+    assert report["paid"] is False
 
 
 def test_final_milestone_sweeps_remainder_and_completes(direct_vm, direct_deploy):

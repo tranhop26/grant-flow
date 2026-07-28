@@ -21,14 +21,14 @@ This repository is a **contract primitive**: a single Python Intelligent Contrac
 
 Every AI judgment runs inside a non-deterministic closure and is accepted only through `gl.eq_principle.prompt_comparative`, whose *principle* tells validators what semantic agreement means:
 
-* **Proposal evaluation** — principle: *"The `decision` field must be identical. Each individual score may differ by at most 2 points and `total` by at most 5. `reasoning` must identify the same main strengths and weaknesses."* Two validators that would decide differently about funding can never both pass — agreement is on the **decision and its substance**, never on JSON shape. Formatting noise is eliminated *before* comparison: outputs are parsed, clamped to the rubric ranges, and normalized inside the nondet closure, so what validators compare is the meaning-bearing core `{scores, total, decision, reasoning}`.
-* **Milestone verification** — principle: *"The `completed` field must be identical. `confidence` may differ by at most 20. `summary` must describe the same evidence and reach the same conclusion."* The evidence page is truncated to a fixed budget and reduced to a derived verdict, following GenLayer guidance to compare **derived outcomes, not raw web data** (timestamps and dynamic content would break consensus).
+* **Proposal evaluation** — every validator deterministically derives `grant_approved = (decision == "approve" and total >= min_total_score)` inside its nondeterministic result. The comparative principle requires this final thresholded economic outcome to be identical. Score drift of at most 2 points per dimension / 5 total is acceptable only when it stays on the same side of the grant threshold.
+* **Milestone verification** — every validator deterministically derives `payout_approved = (completed and confidence >= min_confidence)` inside its nondeterministic result. The comparative principle requires this final payout outcome to be identical. Confidence drift of at most 20 is acceptable only when both results stay on the same side of the payout threshold.
 
 **LLM proposes, code disposes.** Consensus produces a judgment; deterministic Python decides what happens with it:
 
 ```python
-approved = evaluation["decision"] == "approve" and total >= min_score
-passed   = verdict["completed"] and verdict["confidence"] >= min_confidence
+approved = evaluation["grant_approved"]
+passed   = verdict["payout_approved"]
 ```
 
 The LLM never moves money, never sets status directly, and cannot exceed the treasury: approvals are blocked unless the *uncommitted* treasury covers the request (`total_committed` accounting).
@@ -62,10 +62,16 @@ Storage layout: `TreeMap[str, Proposal]` with an `@allow_storage @dataclass` str
 
 | | |
 |---|---|
-| **CONTRACT_ADDRESS** | `0x2127A79c646B041bf66D8858297dD70449e2257e` |
+| **CONTRACT_ADDRESS** | [`0xcCEe9d27b53fDe1411a10b2Aad63eBaED9775a33`](https://explorer-studio.genlayer.com/address/0xcCEe9d27b53fDe1411a10b2Aad63eBaED9775a33) |
+| **DEPLOY_TX** | [`0x3635b8690c2c4eb10ab94697e651c98cf3e04d1156f139f9a12693cb0fab5f03`](https://explorer-studio.genlayer.com/tx/0x3635b8690c2c4eb10ab94697e651c98cf3e04d1156f139f9a12693cb0fab5f03) |
 | **NETWORK** | `studionet` (GenLayer Studio network) |
+| **SOURCE_SHA256** | `382f5ecd098077928112aa9921bd853dbdc04c91b461f7ae93b2960724f11019` |
 
-This instance was configured **on-chain by the owner through the governance setters** after deployment — `set_thresholds(30, 70)` and `set_criteria(<public-goods rubric>)` — because the Studio deploy form did not pass constructor arguments. Anyone can verify the active configuration via `get_config()`: `min_total_score=30`, `min_confidence=70`, the full rubric in `criteria`, `submit_cooldown_secs=0`. Note: `dao_name` is empty on this instance (it is constructor-only by design, with no setter); clients display a fallback label. The deterministic gates behave identically regardless of whether values arrive via constructor or setters.
+The constructor was deployed with the exact settings in
+`deploy/001_deploy_grant_flow.ts`: `dao_name="GenLayer Community Grants"`,
+`min_total_score=30`, `min_confidence=70`, and
+`submit_cooldown_secs=3600`. The source returned by Studionet is byte-for-byte
+identical to `contracts/grant_flow.py` at the SHA-256 digest above.
 
 ### Worked example — *illustrative*
 
@@ -106,7 +112,7 @@ Then `claim_milestone(0, "https://github.com/example/validator-analytics/release
 ```
 .
 ├── contracts/grant_flow.py         # the Intelligent Contract (single file, pure ASCII)
-├── tests/test_grant_flow.py        # 18 tests: rubric gate, payouts, fail-closed negative paths
+├── tests/test_grant_flow.py        # threshold binding, payouts, fail-closed negative paths
 ├── tests/conftest.py               # uses genlayer-test fixtures when installed
 ├── tests/_emulator.py              # fallback fixtures for sandboxes without PyPI access
 ├── tests/run_tests.py              # zero-dependency runner (python3 tests/run_tests.py)
@@ -119,13 +125,14 @@ Then `claim_milestone(0, "https://github.com/example/validator-analytics/release
 ```bash
 pip install -r requirements-dev.txt   # Python 3.12+
 pytest tests/ -v                      # official genlayer-test Direct Mode
+genvm-lint check contracts/grant_flow.py
 # or, with zero dependencies (fallback emulator, same test file):
 python3 tests/run_tests.py
 ```
 
-The suite covers: deploy/config, submission validation (milestone percents, minimum lengths), AI approval and rejection, **the deterministic gate overriding an over-optimistic LLM**, treasury-coverage enforcement, milestone payout on verified evidence, denial on weak evidence, exact remainder sweeping, proposer-only claims, owner access control, pause, cancellation accounting, and the fail-closed negative paths: malformed LLM output, missing decision, unavailable (HTTP 404) evidence, and SSRF-blocked evidence URLs.
+The suite covers: deploy/config, submission validation (milestone percents, minimum lengths), AI approval and rejection, **consensus-bound grant and payout outcomes immediately above and below both thresholds**, treasury-coverage enforcement, milestone payout on verified evidence, denial on weak evidence, exact remainder sweeping, proposer-only claims, owner access control, pause, cancellation accounting, and the fail-closed negative paths: malformed LLM output, missing decision, unavailable (HTTP 404) evidence, and SSRF-blocked evidence URLs.
 
-*Known limitation:* direct mode and the emulator execute leader-only; genuine multi-validator disagreement is exercised on-chain by the equivalence-principle strings (identical decision, bounded drift), not in unit tests.
+*Known limitation:* direct mode and the emulator execute leader-only; genuine multi-validator disagreement is exercised on-chain by the equivalence-principle strings (identical thresholded economic outcome plus bounded same-side drift), not in unit tests.
 
 ## Reuse beyond grants
 
